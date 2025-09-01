@@ -1,0 +1,98 @@
+#!/bin/bash
+
+# Requer permissões de root
+if [ "$EUID" -ne 0 ]; then
+  echo "Por favor, execute como root."
+  exit 1
+fi
+
+echo "[1/7] Renomeando interfaces de rede via Udev..."
+
+# Detecta os dois primeiros MACs
+MAC1=$(ip link show | grep ether | awk 'NR==1{print $2}')
+MAC2=$(ip link show | grep ether | awk 'NR==2{print $2}')
+
+# Verifica se os MACs foram encontrados
+if [ -n "$MAC1" ] && [ -n "$MAC2" ]; then
+  cat > /etc/udev/rules.d/70-persistent-net.rules <<EOF
+SUBSYSTEM=="net", ACTION=="add", ATTR{address}=="$MAC1", NAME="eth1"
+SUBSYSTEM=="net", ACTION=="add", ATTR{address}=="$MAC2", NAME="eth2"
+EOF
+  echo "Interfaces renomeadas com sucesso:"
+  cat /etc/udev/rules.d/70-persistent-net.rules
+else
+  echo "Erro: não foi possível identificar duas interfaces de rede."
+  exit 1
+fi
+
+echo "[2/7] Configurando Netplan..."
+
+# Substitui o arquivo principal do Netplan
+cat > /etc/netplan/50-cloud-init.yaml <<EOF
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    eth1:
+      addresses:
+        - 192.168.10.1/24
+      dhcp4: no
+    eth2:
+      dhcp4: true
+EOF
+
+# Corrige permissões para evitar avisos
+chmod 644 /etc/netplan/50-cloud-init.yaml
+
+# Aplica configuração de rede
+netplan apply
+
+echo "[3/7] Instalando o servidor DHCP..."
+apt update && apt install -y isc-dhcp-server
+
+echo "[4/7] Configurando o servidor DHCP..."
+
+cat > /etc/dhcp/dhcpd.conf <<EOF
+default-lease-time 600;
+max-lease-time 7200;
+
+subnet 192.168.10.0 netmask 255.255.255.0 {
+  range 192.168.10.100 192.168.10.200;
+  option routers 192.168.10.1;
+  option domain-name-servers 8.8.8.8, 8.8.4.4;
+}
+EOF
+
+# Define interface do DHCP corretamente
+if grep -q '^INTERFACESv4=' /etc/default/isc-dhcp-server; then
+  sed -i 's/^INTERFACESv4=.*/INTERFACESv4="eth1"/' /etc/default/isc-dhcp-server
+else
+  echo 'INTERFACESv4="eth1"' >> /etc/default/isc-dhcp-server
+fi
+
+systemctl restart isc-dhcp-server
+systemctl enable isc-dhcp-server
+
+echo "[5/7] Instalando e configurando o servidor SSH..."
+apt install -y openssh-server
+
+# Garante configuração correta de autenticação por senha
+sed -i '/^#\?PasswordAuthentication/d' /etc/ssh/sshd_config
+echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config
+
+# Garante porta 22 (caso tenha sido comentada ou removida)
+if ! grep -q "^Port 22" /etc/ssh/sshd_config; then
+  echo "Port 22" >> /etc/ssh/sshd_config
+fi
+
+systemctl restart ssh
+systemctl enable ssh
+
+echo "[6/7] Finalizando configurações..."
+
+# Desativa cloud-init (opcional, para impedir sobrescritas futuras)
+touch /etc/cloud/cloud-init.disabled
+
+echo "[7/7] O sistema será reiniciado em 5 segundos para aplicar as alterações..."
+sleep 5
+reboot
